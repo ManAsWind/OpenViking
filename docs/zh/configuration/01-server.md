@@ -57,6 +57,7 @@ openviking-server --config /path/to/ov.conf
 | `parsers` | object | 各解析器默认值 | PDF、代码、图片、音视频等解析行为 |
 | `semantic` | object | 内置默认值 | abstract 和 overview 的生成限制 |
 | `parser_api` | object | disabled | 第三方文件解析 API |
+| `compile_api` | object | disabled | 外部 Compile 任务 API |
 | `connector` | object | disabled | 外部 Connector 数据导入服务 |
 | `encryption` | object | disabled | 文件和敏感字段加密 |
 | `git` | object | local | 版本管理后端，可使用 `local` 或 `s3` |
@@ -147,6 +148,8 @@ API 型 `embedding`、`vlm`、`query_planner` 和 `rerank` 配置会复用部分
 
 Rerank 没有单独的 `enabled` 字段；配置了对应 provider 所需的凭证后才会启用。
 
+显式指定 `provider` 时必须提供该 provider 所需的凭证：`vikingdb` 需要 `ak` 和 `sk`，`cohere` 需要 `api_key`，`openai` 需要 `api_key` 和 `api_base`，`litellm` 需要 `model`。凭证不全的配置在加载时即被拒绝。
+
 ## 检索配置
 
 ```json
@@ -222,6 +225,23 @@ Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK �
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---|---:|---|
 | `max_concurrent` | integer | `8` | 同时消费的 SessionCommit 作业数，必须大于 `0`；修改后需重启服务 |
+
+### `queue_workers.external_task`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `10` | 同时消费的外部异步任务数，必须大于 `0`；修改后需重启服务 |
+
+## Compile API 配置
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `base_url` | string | `""` | 外部服务地址，必须包含 `http://` 或 `https://`；非空即启用外部 Compile |
+| `gateway_token` | string | `""` | OV 调用 Compile Gateway 使用的可选服务凭证 |
+| `http_timeout_seconds` | number | `10` | 单次 HTTP 请求超时 |
+| `poll_interval_ms` | integer | `30000` | 外部任务状态轮询间隔 |
+
+配置 `base_url` 后，OV 通过 `X-API-Key` 传递当前用户的 OV API Key；仅在配置 `gateway_token` 时发送 `X-Gateway-Token`。
 
 ## Reindex 配置
 
@@ -347,10 +367,17 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
     "audio": {},
     "video": {},
     "markdown": {},
-    "excel": {},
+    "anydoc": {
+      "enabled": true
+    },
     "html": {},
     "text": {},
-    "directory": {},
+    "directory": {
+      "preserve_structure": true,
+      "max_files": 1000,
+      "max_depth": 10,
+      "max_concurrent": 4
+    },
     "feishu": {
       "domain": "https://open.feishu.cn",
       "max_rows_per_sheet": 1000,
@@ -362,6 +389,19 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 }
 ```
 
+`parsers.directory.max_concurrent` 由服务事件循环中的所有目录导入共享。默认值为
+`4` 时，单个目录可以并发执行 4 个 Understanding 任务；多个目录同时导入时，合计仍最多
+执行 4 个。
+
+启用 Understanding 目录路由时，`max_files` 和 `max_depth` 才约束目录导入。每次
+`DirectoryParser` 扫描会在提交该层 Understanding 请求前独立应用限制；嵌套 ZIP 会启动
+新的目录扫描，不与外层共享文件数量和深度预算。关闭 Understanding 时，OpenViking
+原生目录解析不应用这两个限制。
+
+客户端导入本地目录时，完整目录 ZIP 受 `/resources/temp_upload` 上传大小限制。ZIP
+解压后，`DirectoryParser` 不再设置统一的单文件字节限制；每个入选文件遵循对应内置
+Parser 或 Understanding API 后端自身的限制和上传行为。
+
 | 配置项 | 作用 |
 |---|---|
 | `pdf` | PDF 文本、图片和版面解析 |
@@ -369,7 +409,7 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 | `image` | 图片理解和 OCR |
 | `audio`、`video` | 音视频内容解析 |
 | `markdown`、`html`、`text` | 文本文档分段 |
-| `excel` | Excel 工作表解析与分段 |
+| `anydoc` | Office 和 EPUB 转换；`enabled=false` 时拒绝这些格式 |
 | `directory` | 目录扫描和忽略规则 |
 | `feishu` | 飞书文档访问与解析 |
 | `webfeed` | Sitemap、RSS 和 Atom 导入 |

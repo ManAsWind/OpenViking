@@ -57,6 +57,7 @@ Optional sections use their defaults when omitted. Unknown fields are rejected.
 | `parsers` | object | parser defaults | PDF, code, image, audio, video, and text parsing |
 | `semantic` | object | built-in defaults | Abstract and overview generation limits |
 | `parser_api` | object | disabled | Third-party file parser API |
+| `compile_api` | object | disabled | External Compile task API |
 | `connector` | object | disabled | External Connector ingestion service |
 | `encryption` | object | disabled | File and secret encryption |
 | `git` | object | local | Version backend: `local` or `s3` |
@@ -147,6 +148,8 @@ Changing the model or `dimension` can make existing vector collections incompati
 
 Rerank has no separate `enabled` field. It becomes available when the required provider credentials are configured.
 
+Setting `provider` explicitly requires the credentials that provider needs: `ak` and `sk` for `vikingdb`, `api_key` for `cohere`, `api_key` and `api_base` for `openai`, `model` for `litellm`. An incomplete block is rejected when the configuration loads.
+
 ## Retrieval Settings
 
 ```json
@@ -222,6 +225,23 @@ This setting controls queue-job concurrency. It is separate from `vlm.media.max_
 | Field | Type | Default | Description |
 |---|---|---:|---|
 | `max_concurrent` | integer | `8` | Number of SessionCommit jobs consumed concurrently; must be greater than `0`; requires a server restart after changes |
+
+### `queue_workers.external_task`
+
+| Field | Type | Default | Description |
+|---|---|---:|---|
+| `max_concurrent` | integer | `10` | Number of external asynchronous tasks consumed concurrently; must be greater than `0`; requires a server restart after changes |
+
+## Compile API Settings
+
+| Field | Type | Default | Description |
+|---|---|---:|---|
+| `base_url` | string | `""` | External service base URL, including `http://` or `https://`; a non-empty value enables external Compile |
+| `gateway_token` | string | `""` | Optional service credential used by OV to call the Compile Gateway |
+| `http_timeout_seconds` | number | `10` | Timeout for one HTTP request |
+| `poll_interval_ms` | integer | `30000` | External task polling interval |
+
+When `base_url` is configured, OV sends the current user's OV API key in `X-API-Key`. It sends `X-Gateway-Token` only when `gateway_token` is configured.
 
 ## Reindex Settings
 
@@ -347,10 +367,17 @@ Parsers live under `parsers`:
     "audio": {},
     "video": {},
     "markdown": {},
-    "excel": {},
+    "anydoc": {
+      "enabled": true
+    },
     "html": {},
     "text": {},
-    "directory": {},
+    "directory": {
+      "preserve_structure": true,
+      "max_files": 1000,
+      "max_depth": 10,
+      "max_concurrent": 4
+    },
     "feishu": {
       "domain": "https://open.feishu.cn",
       "max_rows_per_sheet": 1000,
@@ -362,6 +389,24 @@ Parsers live under `parsers`:
 }
 ```
 
+`parsers.directory.max_concurrent` is shared by all directory imports in the
+server event loop. With the default value `4`, one directory can run four
+Understanding jobs concurrently, while multiple concurrent directories still
+run at most four in total.
+
+`max_files` and `max_depth` apply when Understanding directory routing is enabled.
+Each `DirectoryParser` scan applies these limits independently before submitting its
+own Understanding requests. A nested ZIP starts a new directory scan and does not
+share the outer scan's file-count or depth budget.
+When Understanding is disabled, native OpenViking directory parsing does not apply
+these two limits.
+
+When a local directory is added through the client, the complete directory ZIP is
+subject to the `/resources/temp_upload` size limit. After extraction,
+`DirectoryParser` does not impose a common per-file byte limit. Each selected file
+follows the limits and upload behavior of its assigned built-in parser or
+Understanding API backend.
+
 | Setting | Purpose |
 |---|---|
 | `pdf` | PDF text, image, and layout parsing |
@@ -369,7 +414,7 @@ Parsers live under `parsers`:
 | `image` | Image understanding and OCR |
 | `audio`, `video` | Audio/video parsing |
 | `markdown`, `html`, `text` | Text document chunking |
-| `excel` | Workbook parsing and chunking |
+| `anydoc` | Office and EPUB conversion; `enabled=false` rejects those formats |
 | `directory` | Directory scanning and ignore rules |
 | `feishu` | Feishu/Lark access and parsing |
 | `webfeed` | Sitemap, RSS, and Atom ingestion |

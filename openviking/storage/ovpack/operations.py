@@ -14,6 +14,7 @@ from openviking.core.namespace import (
     is_session_uri,
     relative_uri_path,
 )
+from openviking.resource.watch_storage import is_watch_task_control_uri
 from openviking.server.identity import RequestContext
 from openviking.storage.index_consistency import check_index_consistency
 from openviking.storage.ovpack.format import (
@@ -117,7 +118,7 @@ async def _root_exists(viking_fs, root_uri: str, ctx: RequestContext) -> bool:
 
 async def _ensure_parent_exists(viking_fs, parent: str, ctx: RequestContext) -> None:
     try:
-        await viking_fs.stat(parent, ctx=ctx)
+        await viking_fs.stat(parent, ctx=ctx, skip_count=True)
     except Exception:
         await viking_fs.mkdir(parent, ctx=ctx)
 
@@ -405,6 +406,8 @@ async def _backup_entries(viking_fs, ctx: RequestContext) -> list[dict[str, Any]
             scoped_entry = dict(entry)
             scoped_entry["rel_path"] = f"{scope}/{rel_path}"
             scoped_entry["uri"] = join_uri(scope_uri, rel_path)
+            if is_watch_task_control_uri(scoped_entry["uri"]):
+                continue
             entries.append(scoped_entry)
     return entries
 
@@ -696,7 +699,7 @@ async def restore_ovpack(
                 continue
 
             try:
-                target_stat = await viking_fs.stat(target_uri, ctx=ctx)
+                target_stat = await viking_fs.stat(target_uri, ctx=ctx, skip_count=True)
             except (NotFoundError, FileNotFoundError):
                 target_stat = None
 

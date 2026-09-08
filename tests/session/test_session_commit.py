@@ -115,6 +115,172 @@ class TestCommit:
         # Wait for semantic/embedding queues
         await service.resources.wait_processed(timeout=60.0)
 
+    async def test_phase2_splits_with_the_committed_auto_commit_policy(
+        self,
+        session_with_messages: Session,
+        monkeypatch,
+    ):
+        await session_with_messages.update_config(
+            auto_commit_policy={
+                "pending_token_threshold": 0,
+                "message_count_threshold": 1,
+            },
+            update_auto_commit_policy=True,
+        )
+        working_memory_batches = []
+
+        async def generate_summary(
+            _session,
+            messages,
+            latest_archive_overview="",
+            checkpoint_requests=None,
+        ):
+            del checkpoint_requests
+            working_memory_batches.append([message.id for message in messages])
+            return f"{latest_archive_overview}\n{messages[0].id}"
+
+        monkeypatch.setattr(Session, "_generate_archive_summary_async", generate_summary)
+        extract_long_term = AsyncMock(return_value=[])
+        session_with_messages._session_compressor.extract_long_term_memories = extract_long_term
+
+        result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert len(working_memory_batches) == 4
+        assert all(len(batch) == 1 for batch in working_memory_batches)
+        assert extract_long_term.await_count == 4
+        assert all(len(call.kwargs["messages"]) == 1 for call in extract_long_term.await_args_list)
+        phase1 = await session_with_messages._read_phase1_meta(result["archive_uri"])
+        assert phase1["queue_message"]["auto_commit_policy"]["message_count_threshold"] == 1
+
+    async def test_commit_task_reports_intentionally_skipped_memory_operations(
+        self,
+        session_with_messages: Session,
+    ):
+        async def extract_long_term_memories(**kwargs):
+            archive_uri = kwargs["archive_uri"]
+            await session_with_messages._viking_fs.write_file(
+                uri=f"{archive_uri}/memory_diff.json",
+                content=json.dumps(
+                    {
+                        "archive_uri": archive_uri,
+                        "operations": {"adds": [], "updates": [], "deletes": []},
+                        "summary": {
+                            "total_adds": 0,
+                            "total_updates": 0,
+                            "total_deletes": 0,
+                            "total_skipped": 1,
+                        },
+                        "skipped_operations": [
+                            {
+                                "memory_type": "preferences",
+                                "page_id": 102,
+                                "reason_code": "peer_not_allowed",
+                                "reason": "Target peer is outside the allowed memory scope",
+                            }
+                        ],
+                    }
+                ),
+                ctx=session_with_messages.ctx,
+            )
+            return []
+
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock(
+            side_effect=extract_long_term_memories
+        )
+
+        commit_result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(commit_result["task_id"])
+
+        assert commit_result["status"] == "accepted"
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["memory_extraction"] == {
+            "skipped": 1,
+            "skipped_operations": [
+                {
+                    "memory_type": "preferences",
+                    "page_id": 102,
+                    "reason_code": "peer_not_allowed",
+                    "reason": "Target peer is outside the allowed memory scope",
+                }
+            ],
+        }
+
+    async def test_recovered_commit_task_reads_existing_skipped_memory_operations(
+        self,
+        session_with_messages: Session,
+        monkeypatch,
+    ):
+        original_prepare = Session._prepare_phase2_archive_messages
+
+        async def prepare_with_completed_long_term(self, archive_uri, current_messages):
+            (
+                messages,
+                coverage_start_archive,
+                coverage_end_archive,
+                covered_failed_archives,
+                completed_memory_steps,
+            ) = await original_prepare(self, archive_uri, current_messages)
+            completed_memory_steps.setdefault("long_term", set()).update(
+                message.id for message in messages
+            )
+            await self._viking_fs.write_file(
+                uri=f"{archive_uri}/memory_diff.json",
+                content=json.dumps(
+                    {
+                        "archive_uri": archive_uri,
+                        "operations": {"adds": [], "updates": [], "deletes": []},
+                        "summary": {
+                            "total_adds": 0,
+                            "total_updates": 0,
+                            "total_deletes": 0,
+                            "total_skipped": 1,
+                        },
+                        "skipped_operations": [
+                            {
+                                "memory_type": "preferences",
+                                "page_id": 102,
+                                "reason_code": "peer_not_allowed",
+                                "reason": "Target peer is outside the allowed memory scope",
+                            }
+                        ],
+                    }
+                ),
+                ctx=self.ctx,
+            )
+            return (
+                messages,
+                coverage_start_archive,
+                coverage_end_archive,
+                covered_failed_archives,
+                completed_memory_steps,
+            )
+
+        monkeypatch.setattr(
+            Session,
+            "_prepare_phase2_archive_messages",
+            prepare_with_completed_long_term,
+        )
+        session_with_messages._session_compressor.extract_long_term_memories = AsyncMock()
+
+        commit_result = await session_with_messages.commit_async()
+        task_result = await _wait_for_task(commit_result["task_id"])
+
+        assert task_result["status"] == "completed"
+        assert task_result["result"]["memory_extraction"] == {
+            "skipped": 1,
+            "skipped_operations": [
+                {
+                    "memory_type": "preferences",
+                    "page_id": 102,
+                    "reason_code": "peer_not_allowed",
+                    "reason": "Target peer is outside the allowed memory scope",
+                }
+            ],
+        }
+        session_with_messages._session_compressor.extract_long_term_memories.assert_not_awaited()
+
     async def test_commit_default_disables_agent_memory_but_keeps_archive(
         self, session_with_messages: Session
     ):
@@ -365,6 +531,7 @@ class TestCommit:
             ctx,
             allowed_memory_types,
             allow_self_memory=True,
+            peer_memory_enabled=True,
             allowed_peer_ids=None,
             **kwargs,
         ):
@@ -373,6 +540,7 @@ class TestCommit:
                 {
                     "allowed_memory_types": set(allowed_memory_types or set()),
                     "allow_self_memory": allow_self_memory,
+                    "peer_memory_enabled": peer_memory_enabled,
                     "allowed_peer_ids": set(allowed_peer_ids or set()),
                     "roles": [message.role for message in messages],
                     "peer_ids": [message.peer_id for message in messages],
@@ -411,6 +579,7 @@ class TestCommit:
                     "profile",
                 },
                 "allow_self_memory": False,
+                "peer_memory_enabled": True,
                 "allowed_peer_ids": {"web-visitor-alice"},
                 "roles": ["user", "assistant"],
                 "peer_ids": ["web-visitor-alice", "web-visitor-alice"],

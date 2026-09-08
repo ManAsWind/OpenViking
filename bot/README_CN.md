@@ -13,6 +13,8 @@ VikingBot 是 OpenViking 内置的多渠道 AI Agent。它可以在命令行中�
 
 ## 安装
 
+> **OpenViking Server 要求**：VikingBot 通过 `viking://~` Home 别名访问调用方自己的上下文空间（例如 `viking://~/memories/`），因此需要一个支持 `viking://~` 的 Server。不带 uid 的旧写法 `viking://user/memories` 已不再产生，且会被新版 Server 拒绝。
+
 ### 从 PyPI 安装
 
 ```bash
@@ -310,6 +312,7 @@ export OPENVIKING_CONFIG_FILE=/path/to/ov.conf
 | `bot.agents.max_tool_iterations` | `50` | 单轮最大工具迭代数 |
 | `bot.agents.memory_window` | `50` | 本地历史窗口和会话提交消息阈值 |
 | `bot.agents.subagent_enabled` | `true` | 是否提供 `spawn` 工具 |
+| `bot.agents.subagent_max_concurrency` | `4` | 同时运行的后台子 Agent 数量上限 |
 | `bot.gateway.host` | `127.0.0.1` | Gateway 监听地址 |
 | `bot.gateway.port` | `18790` | Gateway 监听端口 |
 | `bot.sandbox.backend` | `direct` | 执行后端 |

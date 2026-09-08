@@ -71,11 +71,6 @@ class VikingClient:
 
         self.admin_user_client = None
         self._user_clients = {}
-        self._namespace_policy = {
-            "isolate_user_scope_by_agent": False,
-            "isolate_agent_scope_by_user": False,
-        }
-        self._namespace_policy_loaded = False
         connection_actor_peer_id = (
             self._request_connection.get("actor_peer_id") if self._request_connection else None
         )
@@ -160,16 +155,6 @@ class VikingClient:
             value = connection.get(key)
             if isinstance(value, str) and value.strip():
                 normalized[key] = value.strip()
-        policy = connection.get("namespace_policy")
-        if isinstance(policy, Mapping):
-            normalized["namespace_policy"] = {
-                "isolate_user_scope_by_agent": bool(
-                    policy.get("isolate_user_scope_by_agent", False)
-                ),
-                "isolate_agent_scope_by_user": bool(
-                    policy.get("isolate_agent_scope_by_user", False)
-                ),
-            }
         if not normalized.get("api_key"):
             if (
                 normalized.get("api_key_type") == "root"
@@ -192,11 +177,6 @@ class VikingClient:
         self.account_id = connection.get("account_id")
         self.admin_user_id = connection.get("user_id")
 
-        policy = connection.get("namespace_policy")
-        if isinstance(policy, dict):
-            self._namespace_policy = policy
-            self._namespace_policy_loaded = True
-
         remote_client_kwargs = {
             "url": self.openviking_config.server_url,
             "profile_enabled": False,
@@ -214,7 +194,6 @@ class VikingClient:
     async def _initialize(self):
         """Initialize the client (must be called after construction)"""
         await self.client.initialize()
-        await self._load_namespace_policy()
 
     @classmethod
     async def create(
@@ -350,54 +329,17 @@ class VikingClient:
         if self.actor_peer_id:
             client_kwargs["actor_peer_id"] = self.actor_peer_id
 
-    async def _load_namespace_policy(self) -> None:
-        if self._namespace_policy_loaded:
-            return
-
-        policy = {
-            "isolate_user_scope_by_agent": False,
-            "isolate_agent_scope_by_user": False,
-        }
-        if self._has_request_connection() or self._is_dev_mode() or self._is_user_key_mode():
-            self._namespace_policy = policy
-            self._namespace_policy_loaded = True
-            return
-
-        if self._is_root_key_mode() and self.account_id:
-            try:
-                accounts = await self.client.admin_list_accounts()
-                for account in accounts or []:
-                    if account.get("account_id") == self.account_id:
-                        policy = {
-                            "isolate_user_scope_by_agent": bool(
-                                account.get("isolate_user_scope_by_agent", False)
-                            ),
-                            "isolate_agent_scope_by_user": bool(
-                                account.get("isolate_agent_scope_by_user", False)
-                            ),
-                        }
-                        break
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load account namespace policy for {self.account_id}: {e}"
-                )
-
-        self._namespace_policy = policy
-        self._namespace_policy_loaded = True
-
     def _user_space_fragment(self, user_id: Optional[str]) -> str:
         effective_user_id = self._effective_user_id(user_id)
         if not effective_user_id:
             return ""
-        if self._namespace_policy["isolate_user_scope_by_agent"] and self.agent_id:
-            return f"{effective_user_id}/agent/{self.agent_id}"
         return effective_user_id
 
     def _memory_target_uri(self, user_id: Optional[str]) -> str:
         user_space = self._user_space_fragment(user_id)
         if user_space:
             return f"viking://user/{user_space}/memories/"
-        return "viking://user/memories/"
+        return "viking://~/memories/"
 
     def _owner_user_id_for_uri(self, uri: Optional[str]) -> Optional[str]:
         if not self._is_root_key_mode():
@@ -408,6 +350,11 @@ class VikingClient:
             return None
         if len(parts) < 2 or parts[0] != "user":
             return None
+        # Mirrors the server's reserved user-space segment set. We keep the duplicated
+        # allowlist so legacy ``viking://user/<reserved>/...`` URIs (still present in stored
+        # bot configs and occasionally produced by LLM output) are not misrouted to a user
+        # named e.g. "memories" while running in root-key mode. Home-alias URIs
+        # (``viking://~/...``) never reach this branch and return None naturally.
         if parts[1] in {"memories", "resources", "skills", "peers", "privacy", "sessions"}:
             return None
         owner_user_id = parts[1]
@@ -435,7 +382,7 @@ class VikingClient:
         if not normalized_peer_id:
             raise ValueError("peer_id is required for peer memory target")
         if self._is_user_key_mode() or self._has_request_connection():
-            return f"viking://user/peers/{normalized_peer_id}/memories/"
+            return f"viking://~/peers/{normalized_peer_id}/memories/"
         user_space = self._current_user_space_fragment()
         if not user_space:
             raise ValueError("peer memory target requires current user_id")
@@ -556,11 +503,17 @@ class VikingClient:
         limit: int = 10,
     ):
         """搜索资源"""
-        kwargs: Dict[str, Any] = {"limit": limit}
+        # The SDK find/search sync moved context_type/filter out of top-level
+        # find() kwargs into FindOptions. Adapt here so callers keep the stable
+        # VikingClient.find(context_type=..., filter=...) interface.
+        options: Dict[str, Any] = {}
         if context_type is not None:
-            kwargs["context_type"] = context_type
+            options["context_type"] = context_type
         if filter is not None:
-            kwargs["filter"] = filter
+            options["filter"] = filter
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if options:
+            kwargs["options"] = options
         if target_uri:
             return await self.client.find(query, target_uri=target_uri, **kwargs)
         return await self.client.find(query, **kwargs)
@@ -572,7 +525,11 @@ class VikingClient:
         to: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """添加资源到 Viking"""
-        result = await self.client.add_resource(path=local_path, to=to, reason=desc)
+        result = await self.client.add_resource(
+            path=local_path,
+            to=to,
+            options={"reason": desc},
+        )
         return result
 
     async def list_resources(
@@ -588,7 +545,17 @@ class VikingClient:
         return entries
 
     async def stat(self, uri: str) -> Dict[str, Any]:
-        return await self.client.stat(uri)
+        client = self.client
+        should_close = False
+        scoped_user_id = self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+
+        try:
+            return await client.stat(uri)
+        finally:
+            if should_close:
+                await client.close()
 
     async def attrs(self, uri: str) -> Dict[str, Any]:
         return await self.client.attrs(uri)
@@ -603,7 +570,17 @@ class VikingClient:
         return await self.client.read_raw(uri, offset=offset, limit=limit)
 
     async def download_bytes(self, uri: str) -> bytes:
-        return await self.client.download_bytes(uri)
+        client = self.client
+        should_close = False
+        scoped_user_id = self._owner_user_id_for_uri(uri)
+        if scoped_user_id:
+            client, should_close = await self._get_user_scoped_client(scoped_user_id)
+
+        try:
+            return await client.download_bytes(uri)
+        finally:
+            if should_close:
+                await client.close()
 
     async def find_skills(
         self,
@@ -739,7 +716,7 @@ class VikingClient:
         """读取用户 profile。"""
         effective_user_id = self._effective_user_id(user_id)
         if not effective_user_id:
-            return await self.read_content(uri="viking://user/memories/profile.md", level="read")
+            return await self.read_content(uri="viking://~/memories/profile.md", level="read")
 
         uri = f"{self._memory_target_uri(effective_user_id)}profile.md"
         result = await self.read_content(uri=uri, level="read", user_id=effective_user_id)
@@ -1160,7 +1137,7 @@ class VikingClient:
 
         return await client.create_session(
             session_id=session_id,
-            memory_policy=memory_policy,
+            options={"memory_policy": memory_policy} if memory_policy is not None else None,
         )
 
     @staticmethod

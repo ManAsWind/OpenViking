@@ -31,9 +31,11 @@ from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Respo
 from openviking.server.profile_middleware import create_profile_http_middleware
 from openviking.server.request_id import REQUEST_ID_HEADER, RequestIdMiddleware
 from openviking.server.routers import (
+    acl_router,
     admin_router,
     agent_evolution_router,
     bot_router,
+    compile_router,
     console_router,
     content_router,
     debug_router,
@@ -139,6 +141,15 @@ async def _initialize_runtime_state(
     """Initialize service and auth dependencies before traffic is accepted."""
     await service.initialize()
     await _initialize_auth_plugin(app, service, config)
+    manager = app.state.api_key_manager
+    if manager is not None:
+        await service.load_acl_settings(
+            [
+                item["account_id"]
+                for item in manager.get_accounts()
+                if item["account_id"] != service.user.account_id
+            ]
+        )
     from openviking.service.user_deletion import setup_user_deletion
 
     app.state.user_deletion_service = await setup_user_deletion(
@@ -293,6 +304,8 @@ def create_app(
     if service is not None:
         _configure_session_runtime(service)
 
+    bot_gateway_token = load_bot_gateway_token() if config.with_bot else ""
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         """Application lifespan handler."""
@@ -302,6 +315,8 @@ def create_app(
             service = OpenVikingService()
 
         assert service is not None
+        if config.with_bot:
+            service.compile.configure_local_backend(config.bot_api_url, bot_gateway_token)
         _configure_session_runtime(service)
         set_service(service)
 
@@ -600,15 +615,17 @@ def create_app(
         import openviking.server.routers.bot as bot_module
 
         bot_module.set_bot_api_url(config.bot_api_url)
-        bot_module.set_bot_api_key(load_bot_gateway_token())
+        bot_module.set_bot_api_key(bot_gateway_token)
         logger.info(f"Bot API proxy enabled, forwarding to {config.bot_api_url}")
     else:
         logger.info("Bot API proxy disabled (use --with-bot to enable)")
 
     # Register routers
     app.include_router(system_router)
+    app.include_router(acl_router)
     app.include_router(admin_router)
     app.include_router(agent_evolution_router)
+    app.include_router(compile_router)
     app.include_router(resources_router)
     app.include_router(filesystem_router)
     app.include_router(content_router)

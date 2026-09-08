@@ -117,6 +117,8 @@ export type CompactOpenVikingSessionParams = {
   logger: ContextEngineLifecycleLogger;
   resolveAgentId: (sessionId: string, sessionKey?: string, ovSessionId?: string) => string;
   isBypassedSession: (params: { sessionId?: string; sessionKey?: string }) => boolean;
+  /** Host-native compaction for bypassed sessions; resolves undefined when unavailable. */
+  runtimeCompact?: () => Promise<CompactOpenVikingSessionResult | undefined>;
   diag: (stage: string, sessionId: string, data: Record<string, unknown>) => void;
 };
 
@@ -441,10 +443,16 @@ export async function assembleOpenVikingSession({
   hasAutoRecallBlock,
   prependRecallToLatestUserMessage,
 }: AssembleOpenVikingSessionParams): Promise<AssembleOpenVikingSessionResult> {
-  const ovSessionId = openClawSessionToOvStorageId(sessionId, sessionKey);
-  const sender = extractRuntimeSenderId(runtimeContext);
   const latestMessage = messages.at(-1);
   const isTransformContextAssemble = !isMainAssemble;
+
+  // Tool-loop calls do no recall work on non-user tails; avoid scanning the full history.
+  if (isTransformContextAssemble && latestMessage?.role !== "user") {
+    return { messages, estimatedTokens: 0 };
+  }
+
+  const ovSessionId = openClawSessionToOvStorageId(sessionId, sessionKey);
+  const sender = extractRuntimeSenderId(runtimeContext);
   const originalTokens = roughEstimate(messages);
 
   rememberSessionAgentId?.({
@@ -468,16 +476,6 @@ export async function assembleOpenVikingSession({
   }
 
   if (isTransformContextAssemble) {
-    if (latestMessage?.role !== "user") {
-      return assemblePassthrough({
-        diag,
-        ovSessionId,
-        reason: "transform_context_non_user_tail",
-        liveMessages: messages,
-        originalTokens,
-        extra: { latestRole: latestMessage?.role ?? null },
-      });
-    }
     if (!cfg.autoRecall) {
       return assemblePassthrough({ diag, ovSessionId, reason: "transform_context_auto_recall_disabled", liveMessages: messages, originalTokens });
     }
@@ -501,8 +499,8 @@ export async function assembleOpenVikingSession({
       const routingRef = sessionId ?? sessionKey ?? ovSessionId;
       const agentId = resolveAgentId(routingRef, sessionKey, ovSessionId);
       const actorPeerId = resolveOpenVikingActorPeerId({
-        peerRole: cfg.peer_role ?? "assistant",
-        personPeerId: sanitizeOpenVikingPeerId(sender.senderId),
+        peerRole: cfg.peer_role ?? "none",
+        senderPeerId: sanitizeOpenVikingPeerId(sender.senderId),
         assistantPeerId: agentId,
       });
       const queryConfig = await queryConfigStore?.getEffective({
@@ -914,9 +912,9 @@ export async function afterTurnOpenVikingSession({
           undefined,
           createdAt,
           resolveOpenVikingMessagePeerId({
-            peerRole: cfg.peer_role ?? "assistant",
+            peerRole: cfg.peer_role ?? "none",
             role: msg.role,
-            personPeerId: senderRoleId,
+            senderPeerId: senderRoleId,
             assistantPeerId: agentId,
           }),
         );
@@ -1018,6 +1016,7 @@ export async function compactOpenVikingSession({
   logger,
   resolveAgentId,
   isBypassedSession,
+  runtimeCompact,
   diag,
 }: CompactOpenVikingSessionParams): Promise<CompactOpenVikingSessionResult> {
   const ovSessionId = openClawSessionToOvStorageId(sessionId, sessionKey);
@@ -1031,6 +1030,18 @@ export async function compactOpenVikingSession({
   });
 
   if (isBypassedSession({ sessionId, sessionKey })) {
+    // Bypassed sessions store nothing in OV, but the host still needs a real
+    // compaction (preflight hard-fails on an unknown skip reason), so hand the
+    // request to OpenClaw's native compactor.
+    const delegated = await runtimeCompact?.();
+    if (delegated) {
+      diag("compact_result", ovSessionId, {
+        ok: delegated.ok,
+        compacted: delegated.compacted,
+        reason: delegated.reason ?? "session_bypassed_runtime_compaction",
+      });
+      return delegated;
+    }
     diag("compact_result", ovSessionId, {
       ok: true,
       compacted: false,

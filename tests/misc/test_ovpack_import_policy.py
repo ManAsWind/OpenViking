@@ -36,7 +36,8 @@ class FakeVikingFS:
         self.existing_roots = existing_roots or set()
         self.removed_roots: list[str] = []
 
-    async def stat(self, uri: str, ctx=None):
+    async def stat(self, uri: str, ctx=None, skip_count=False):
+        assert skip_count is True
         return {"uri": uri, "isDir": True}
 
     async def mkdir(self, uri: str, exist_ok: bool = False, ctx=None):
@@ -181,6 +182,9 @@ class FakeBackupVikingFS:
     def __init__(self) -> None:
         self.binary_files = {
             "viking://resources/README.md": b"hello",
+            "viking://resources/.watch_tasks.json": b"{}",
+            "viking://resources/.watch_tasks.json.bak": b"{}",
+            "viking://resources/.watch_tasks.json.tmp": b"{}",
             "viking://user/resources/sessions/sess_1/.meta.json": b'{"session_id":"sess_1"}',
         }
         self.tree_contexts: list[tuple[str, RequestContext]] = []
@@ -204,7 +208,25 @@ class FakeBackupVikingFS:
                     "uri": "viking://resources/README.md",
                     "isDir": False,
                     "size": 5,
-                }
+                },
+                {
+                    "rel_path": ".watch_tasks.json",
+                    "uri": "viking://resources/.watch_tasks.json",
+                    "isDir": False,
+                    "size": 2,
+                },
+                {
+                    "rel_path": ".watch_tasks.json.bak",
+                    "uri": "viking://resources/.watch_tasks.json.bak",
+                    "isDir": False,
+                    "size": 2,
+                },
+                {
+                    "rel_path": ".watch_tasks.json.tmp",
+                    "uri": "viking://resources/.watch_tasks.json.tmp",
+                    "isDir": False,
+                    "size": 2,
+                },
             ]
         if uri == "viking://user":
             return [
@@ -614,8 +636,15 @@ async def test_backup_restore_contract(
         names = set(zf.namelist())
         manifest = json.loads(zf.read("openviking-backup/_ovpack/manifest.json").decode("utf-8"))
 
+    manifest_paths = {entry["path"] for entry in manifest["entries"]}
     assert "openviking-backup/files/resources/README.md" in names
     assert "openviking-backup/files/user/resources/sessions/sess_1/.meta.json" in names
+    assert "openviking-backup/files/resources/.watch_tasks.json" not in names
+    assert "openviking-backup/files/resources/.watch_tasks.json.bak" not in names
+    assert "openviking-backup/files/resources/.watch_tasks.json.tmp" not in names
+    assert "resources/.watch_tasks.json" not in manifest_paths
+    assert "resources/.watch_tasks.json.bak" not in manifest_paths
+    assert "resources/.watch_tasks.json.tmp" not in manifest_paths
     assert all(ctx.role == Role.ROOT for _, ctx in backup_fs.tree_contexts)
     assert manifest["root"] == {
         "name": "openviking-backup",

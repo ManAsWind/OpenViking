@@ -124,14 +124,25 @@ The main rules are:
 - reuse `sessionId` directly when it is already a UUID
 - prefer `sessionKey` when deriving a stable `ovSessionId`
 - normalize unsafe path characters, or fall back to a stable SHA-256 when needed
-- `peer_role=assistant` is the default and writes assistant messages with `peer_id=<sessionAgent>`; if `peer_prefix` is set, the value becomes `<peer_prefix>_<sessionAgent>`
-- `peer_role=none` disables peer message attribution and actor-peer routing
-- `peer_role=person` writes user messages with `peer_id` derived from OpenClaw sender identity; assistant messages do not get `peer_id`
-- data-plane recall/search/read/import/delete sends the same resolved peer identity as `X-OpenViking-Actor-Peer` when `peer_role` is `assistant` or `person`
+- `peer_role=none` is the default: messages have no peer attribution and memory stays in the shared user scope, for example `viking://user/alice/memories/...`; no peer-specific memory subtree is used
+- `peer_role=assistant` writes assistant messages with `peer_id=<sessionAgent>` and uses peer-scoped memory such as `viking://user/alice/peers/main/memories/...`; if `peer_prefix` is set, the peer id becomes `<peer_prefix>_<sessionAgent>`
+- `peer_role=sender` writes user messages with the OpenClaw sender identity as `peer_id` and uses peer-scoped memory such as `viking://user/support-agent/peers/customer-42/memories/...`; assistant messages do not get `peer_id`
+- `person` remains accepted as a legacy config alias for `sender`, but new configuration and documentation use `sender`
+- data-plane recall/search/read/import/delete sends the same resolved peer identity as `X-OpenViking-Actor-Peer` when `peer_role` is `assistant` or `sender`
 - when OpenClaw does not provide a session agent, use its default agent `main` for local session and assistant peer metadata
 - only add `X-OpenViking-Account` / `X-OpenViking-User` when `accountId` / `userId` are explicitly configured
 
 This matters because OpenViking tenant identity is account/user-scoped, while OpenClaw agent identity is runtime metadata.
+
+Choose the scope from what `viking://user/<user_id>` represents:
+
+| Model | Example | Result |
+| --- | --- | --- |
+| General/shared (`none`) | `user_id=alice` uses any OpenClaw assistant | Shared user memory under `viking://user/alice/memories/...` |
+| Human is the OpenViking user (`assistant`) | Alice uses OpenClaw assistants `main` and `research` | Assistant-scoped memories are separated under `.../peers/main/memories/...` and `.../peers/research/memories/...` |
+| Agent is the OpenViking user (`sender`) | `user_id=support-agent` receives messages from `customer-42` and `customer-99` | Sender-scoped memories are separated under `.../peers/customer-42/memories/...` and `.../peers/customer-99/memories/...` |
+
+OpenViking creates the managed `peers/` container as part of the user namespace. `none` means that the plugin does not create or route into a specific `peers/<peer_id>/memories` subtree. With `assistant` or `sender`, actor-peer recall includes the shared user memory plus the current peer's memory; changing the setting does not move existing memories.
 
 The recommended remote-mode configuration only needs:
 
@@ -143,7 +154,7 @@ The recommended remote-mode configuration only needs:
 In this setup:
 
 - `apiKey` should usually be a user key
-- new installs default to `peer_role=assistant`
+- new installs default to `peer_role=none`
 - `accountId` / `userId` are advanced options only when the deployment needs explicit identity headers, such as root-key or trusted-server flows
 
 ### User namespace
@@ -164,16 +175,9 @@ During recall, the plugin:
 1. Extracts query text from the latest user message.
 2. Resolves the agent routing for the current `sessionId/sessionKey`.
 3. Runs a quick availability precheck so model requests do not stall when OpenViking is unavailable.
-4. Queries the configured `recallTargetTypes` (`user,agent` by default; optionally `resource`; use `ov_archive_search` and `ov_archive_expand` for session history).
-5. Deduplicates, threshold-filters, reranks, and trims the results under a token budget.
-6. Prepends the selected memories as a `## Long-term Memories` section inside `<openviking-context>` to the current user message; it does not append a standalone synthetic user message.
-
-The reranking logic is not pure vector-score sorting. The current implementation also considers:
-
-- whether a result is a leaf memory with `level == 2`
-- whether it looks like a preference memory
-- whether it looks like an event memory
-- lexical overlap with the current query
+4. Sends one session-aware context search for the configured `recallTargetTypes` (`user,agent` by default; optionally `resource`; use `ov_archive_search` and `ov_archive_expand` to inspect raw session history).
+5. Lets OpenViking expand the query from session history, filter and rank candidates, apply cross-turn deduplication, select detail tiers, and assemble the result under the injection budget.
+6. Prepends the server-rendered context inside `<relevant-memories>` to the current user message; it does not append a standalone synthetic user message.
 
 ## Session Lifecycle
 
@@ -269,7 +273,7 @@ They serve different roles:
 Resource and skill imports are intentionally separate because they land in different OpenViking namespaces and use different server APIs:
 
 - resources go through `/api/v1/resources` and land under `viking://resources/...`
-- skills go through `/api/v1/skills` and land under `viking://user/skills/...`
+- skills go through `/api/v1/skills` and land under `viking://user/<uid>/skills/...`
 
 The plugin also registers explicit slash commands for manual imports:
 
@@ -277,7 +281,7 @@ The plugin also registers explicit slash commands for manual imports:
 /add-resource ./README.md --to viking://resources/openviking-readme --wait
 /add-skill ./skills/install-openviking-memory --wait
 /ov-search "OpenViking install" --uri viking://resources/openviking-readme
-/ov-search "memory install skill" --uri viking://user/skills
+/ov-search "memory install skill" --uri viking://~/skills
 ```
 
 Resource import supports remote URLs, Git URLs, local files, local directories, and uploaded zip files. OpenViking's built-in parsers cover common documents and media such as Markdown, text, PDF, HTML, Word, PowerPoint, Excel, EPUB, images, audio, and video. Directory imports also accept common code, documentation, and config file extensions such as `.py`, `.js`, `.ts`, `.go`, `.rs`, `.java`, `.cpp`, `.json`, `.yaml`, `.toml`, `.csv`, `.rst`, `.proto`, `.tf`, and `.vue`.

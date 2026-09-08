@@ -1,7 +1,9 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import inspect
 import json
+from dataclasses import fields
 from unittest.mock import AsyncMock
 
 import pytest
@@ -49,9 +51,16 @@ class _MemoryVikingFS:
         self.files[uri] = content
 
 
+def test_phase2_auto_commit_policy_parameters_are_appended():
+    signature = inspect.signature(Session._run_memory_extraction)
+
+    assert list(signature.parameters)[-1] == "auto_commit_policy"
+    assert fields(SessionCommitMsg)[-1].name == "auto_commit_policy"
+
+
 @pytest.mark.asyncio
 async def test_resume_queued_commit_continues_phase2(monkeypatch):
-    session_uri = "viking://user/sessions/session-1"
+    session_uri = "viking://user/default/sessions/session-1"
     archive_uri = f"{session_uri}/history/archive_001"
     archived = Message(id="archived", role="user", parts=[TextPart("old")])
     retained = Message(id="retained", role="assistant", parts=[TextPart("new")])
@@ -74,6 +83,7 @@ async def test_resume_queued_commit_continues_phase2(monkeypatch):
         archive_uri=archive_uri,
         user={"account_id": "default", "user_id": "default"},
         memory_policy={"memory_types": []},
+        auto_commit_policy={"pending_token_threshold": 8000},
     )
 
     try:
@@ -84,6 +94,9 @@ async def test_resume_queued_commit_continues_phase2(monkeypatch):
     session._run_memory_extraction.assert_awaited_once()
     assert session._run_memory_extraction.await_args.kwargs["task_id"] == "task-1"
     assert session._run_memory_extraction.await_args.kwargs["agent_evolution_enabled"] is True
+    assert session._run_memory_extraction.await_args.kwargs["auto_commit_policy"] == {
+        "pending_token_threshold": 8000
+    }
     assert [
         item.id for item in session._run_memory_extraction.await_args.kwargs["messages"]
     ] == ["archived"]
@@ -94,7 +107,7 @@ async def test_resume_queued_commit_continues_phase2(monkeypatch):
 async def test_resume_queued_commit_fails_terminally_for_unreadable_archive(
     monkeypatch, archive_content
 ):
-    session_uri = "viking://user/sessions/session-1"
+    session_uri = "viking://user/default/sessions/session-1"
     archive_uri = f"{session_uri}/history/archive_001"
     files = {}
     if archive_content is not None:
@@ -126,7 +139,7 @@ async def test_resume_queued_commit_fails_terminally_for_unreadable_archive(
 
 @pytest.mark.asyncio
 async def test_session_context_skips_pending_archive_with_missing_messages(monkeypatch):
-    session_uri = "viking://user/sessions/session-1"
+    session_uri = "viking://user/default/sessions/session-1"
     archive_uri = f"{session_uri}/history/archive_001"
     session = Session(
         viking_fs=_MemoryVikingFS({}),
@@ -150,7 +163,7 @@ async def test_session_context_skips_pending_archive_with_missing_messages(monke
 
 @pytest.mark.asyncio
 async def test_resume_queued_commit_uses_agent_evolution_archive_snapshot(monkeypatch):
-    session_uri = "viking://user/sessions/session-1"
+    session_uri = "viking://user/default/sessions/session-1"
     archive_uri = f"{session_uri}/history/archive_001"
     archived = Message(id="archived", role="user", parts=[TextPart("old")])
     files = {
@@ -202,12 +215,13 @@ def test_session_commit_message_ignores_unknown_fields():
         {
             "task_id": "task-1",
             "session_id": "session-1",
-            "session_uri": "viking://user/sessions/session-1",
-            "archive_uri": "viking://user/sessions/session-1/history/archive_001",
+            "session_uri": "viking://user/default/sessions/session-1",
+            "archive_uri": "viking://user/default/sessions/session-1/history/archive_001",
             "user": {"account_id": "default", "user_id": "default"},
             "actor_peer_id": "visitor-a",
         }
     )
 
     assert message.task_id == "task-1"
+    assert message.auto_commit_policy == {}
     assert "actor_peer_id" not in message.to_dict()

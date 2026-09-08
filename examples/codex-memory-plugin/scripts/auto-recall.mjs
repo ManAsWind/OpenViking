@@ -34,9 +34,9 @@ import {
 } from "./shared/recall-core.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
-const cfg = loadConfig();
+let cfg = loadConfig();
 const { log, logError } = createLogger("auto-recall");
-const effectivePeer = resolveEffectivePeerId({ cfg, cwd: process.cwd() });
+let effectivePeer = resolveEffectivePeerId({ cfg, cwd: process.cwd() });
 
 let emitted = false;
 let activeCompressor = null;
@@ -240,13 +240,13 @@ async function searchScope(query, targetUri, limit, bucket = "memories", session
 
 // Candidate target URIs for a bucket, most-specific first. In trusted mode a
 // user's memories live under viking://user/<user>/<bucket>; in api_key mode the
-// server canonicalizes the generic viking://user/<bucket> to the authenticated
-// user. Trying the user-scoped path first with the generic path as a fallback
-// recalls correctly in both modes. De-duped so a missing/blank user never
-// doubles the request count.
+// configured user may be unknown, so the viking://~ home alias lets the server
+// resolve the authenticated caller's own space. Trying the user-scoped path
+// first with the home alias as a fallback recalls correctly in both modes.
+// De-duped so a missing/blank user never doubles the request count.
 function userScopedTargets(kind) {
   const suffix = kind.replace(/^\/+/, "");
-  const targets = [`viking://user/${suffix}`];
+  const targets = [`viking://~/${suffix}`];
   if (cfg.user) {
     targets.unshift(`viking://user/${cfg.user}/${suffix}`);
   }
@@ -341,6 +341,23 @@ async function recallViaServerAssembly(query, ovSessionId = "") {
     log,
   });
   if (assembled) {
+    // `peer_scope: "all"` already sweeps every peer under this user; only
+    // under "actor" does the pre-git peer need asking separately.
+    const legacyPeerId = effectivePeer.legacyPeerId;
+    if (cfg.recallPeerScope === "actor" && legacyPeerId && legacyPeerId !== effectivePeer.peerId) {
+      const legacy = await fetchAssembledContext(fetchJSON, assembleCfg, query, {
+        actorPeerId: legacyPeerId,
+        sessionId: ovSessionId,
+        log,
+      });
+      if (legacy) {
+        log("recall_legacy_peer_hit", { legacyPeerId });
+        return assembledToRecallResult(
+          [assembled.rendered, legacy.rendered].filter(Boolean).join("\n"),
+          [...(assembled.entries || []), ...(legacy.entries || [])],
+        );
+      }
+    }
     return assembledToRecallResult(assembled.rendered, assembled.entries);
   }
 
@@ -421,7 +438,7 @@ async function getRecallCompressorProfile() {
 async function runCodexCompressor(prompt, profile) {
   const tmp = await mkdtemp(join(tmpdir(), "ov-recall-compress-"));
   const outputPath = join(tmp, "last-message.txt");
-  const args = buildCodexExecArgs(profile, outputPath);
+  const args = buildCodexExecArgs(profile, outputPath, cfg);
 
   try {
     return await new Promise((resolve) => {
@@ -548,12 +565,6 @@ ${JSON.stringify(payload, null, 2)}
 }
 
 async function main() {
-  if (!cfg.autoRecall) {
-    log("skip", { stage: "init", reason: "autoRecall disabled" });
-    emit();
-    return;
-  }
-
   let input;
   try {
     const chunks = [];
@@ -561,6 +572,18 @@ async function main() {
     input = JSON.parse(Buffer.concat(chunks).toString());
   } catch {
     log("skip", { stage: "stdin_parse", reason: "invalid input" });
+    emit();
+    return;
+  }
+
+  // The workspace layer belongs to the session's directory, which only the
+  // payload knows; see loadConfig for why re-resolving this late is safe.
+  const cwd = typeof input.cwd === "string" && input.cwd.trim() ? input.cwd : process.cwd();
+  cfg = loadConfig(cwd);
+  effectivePeer = resolveEffectivePeerId({ cfg, cwd });
+
+  if (!cfg.autoRecall) {
+    log("skip", { stage: "init", reason: "autoRecall disabled" });
     emit();
     return;
   }

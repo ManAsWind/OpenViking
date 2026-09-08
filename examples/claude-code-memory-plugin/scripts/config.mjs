@@ -135,8 +135,17 @@ export function isPluginEnabled() {
  * Load the full plugin configuration.
  *
  * Resolution: env vars → ovcli.conf → ov.conf → defaults.
+ *
+ * `cwd` selects the workspace layer (`.openviking/config.json` and the
+ * registry entry for that directory). It defaults to this process's directory,
+ * which is all a hook knows at module load; a hook whose payload names the
+ * session's directory calls this again with it. Re-resolving that late is safe
+ * because a workspace file may not carry connection or credential keys, so
+ * baseUrl/apiKey cannot move — loggers and fetch helpers built from the first
+ * load stay valid.
  */
-export function loadConfig() {
+export function loadConfig(cwd = process.cwd()) {
+  const workspaceCwd = str(cwd, "") || process.cwd();
   const ovConf = tryLoadJsonFile("OPENVIKING_CONFIG_FILE", DEFAULT_OV_CONF_PATH);
   const cliConf = tryLoadJsonFile("OPENVIKING_CLI_CONFIG_FILE", DEFAULT_OVCLI_CONF_PATH);
 
@@ -147,7 +156,7 @@ export function loadConfig() {
   const server = ovFile.server || {};
   // ovcli.conf plugin.<harness> overrides plugin.* which overrides ov.conf's
   // claude_code section, so client-side tuning no longer needs a server config.
-  const pluginSettings = loadPluginSettings(HARNESS_KEYS.claudeCode);
+  const pluginSettings = loadPluginSettings(HARNESS_KEYS.claudeCode, process.env, { cwd: workspaceCwd });
   const cc = { ...(ovFile.claude_code || {}), ...pluginSettings };
 
   // baseUrl: env → ovcli.url → ov.server.url → http://{host}:{port}
@@ -167,11 +176,31 @@ export function loadConfig() {
 
   // apiKey: env → ovcli.api_key → cc.apiKey → server.root_api_key
   // Accepts OPENVIKING_BEARER_TOKEN or OPENVIKING_API_KEY (sent as Bearer either way).
-  const apiKey = str(process.env.OPENVIKING_BEARER_TOKEN, null)
-    || str(process.env.OPENVIKING_API_KEY, null)
+  const envApiKey = str(process.env.OPENVIKING_BEARER_TOKEN, null)
+    || str(process.env.OPENVIKING_API_KEY, null);
+  const apiKey = envApiKey
     || str(cliFile.api_key, null)
     || str(cc.apiKey, null)
     || str(server.root_api_key, "");
+
+  // Which source actually supplied the api_key. `configPath` only reports the
+  // file that parsed, so debug logs and 401 hints pointed at the wrong file
+  // whenever both configs existed.
+  const ccApiKeyFromCli = hasOwn(pluginSettings, "apiKey");
+  let credentialSource = "none";
+  let credentialPath = null;
+  if (envApiKey) {
+    credentialSource = "env";
+  } else if (str(cliFile.api_key, null)) {
+    credentialSource = "ovcli";
+    credentialPath = cliConf?.configPath || null;
+  } else if (str(cc.apiKey, null)) {
+    credentialSource = ccApiKeyFromCli ? "ovcli" : "ov";
+    credentialPath = (ccApiKeyFromCli ? cliConf?.configPath : ovConf?.configPath) || null;
+  } else if (str(server.root_api_key, null)) {
+    credentialSource = "ov";
+    credentialPath = ovConf?.configPath || null;
+  }
 
   // accountId: env → ovcli.account → cc.accountId → ""
   const accountId = str(process.env.OPENVIKING_ACCOUNT, null)
@@ -225,12 +254,16 @@ export function loadConfig() {
 
   return {
     configPath,
+    credentialSource,
+    credentialPath,
     baseUrl,
     apiKey,
     accountId,
     userId,
     peerId,
     workspacePeer,
+    peerSource: str(process.env.OPENVIKING_PEER_SOURCE, null) ?? cc.peerSource,
+    harness: "claude-code",
     timeoutMs,
     userAgent: USER_AGENT,
 

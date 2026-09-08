@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from vikingbot.agent import memory as memory_module
@@ -48,14 +49,19 @@ class _DummyHTTPClient:
         self.find_calls = []
         self.ls_calls = []
         self.read_calls = []
+        self.stat_calls = []
+        self.download_calls = []
         self.closed = False
         _DummyHTTPClient.instances.append(self)
 
     async def initialize(self):
         return None
 
-    async def create_session(self, session_id=None, memory_policy=None):
-        return {"session_id": session_id or "s-1", "memory_policy": memory_policy}
+    async def create_session(self, session_id=None, options=None):
+        return {
+            "session_id": session_id or "s-1",
+            "memory_policy": (options or {}).get("memory_policy"),
+        }
 
     async def session_exists(self, _session_id):
         return False
@@ -101,6 +107,14 @@ class _DummyHTTPClient:
     async def read(self, uri):
         self.read_calls.append(("read", uri))
         return ""
+
+    async def stat(self, uri):
+        self.stat_calls.append(uri)
+        return {"size": 8, "isDir": False}
+
+    async def download_bytes(self, uri):
+        self.download_calls.append(uri)
+        return b"image"
 
     async def grep(self, *_args, **_kwargs):
         return {"matches": []}
@@ -223,14 +237,14 @@ def test_openviking_config_api_key_type_empty_values_are_inferred():
     assert config.api_key == "root-key"
 
 
-def test_user_key_current_memory_targets_use_current_user_shorthand(monkeypatch):
+def test_user_key_current_memory_targets_use_home_alias(monkeypatch):
     monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
 
     client = VikingClient()
 
     assert client.build_current_memory_target_uris(peer_ids=["sender-1"]) == [
-        "viking://user/memories/",
-        "viking://user/peers/sender-1/memories/",
+        "viking://~/memories/",
+        "viking://~/peers/sender-1/memories/",
     ]
 
 
@@ -901,23 +915,21 @@ def test_memory_user_cli_option_warns_at_runtime(capsys):
 
 
 @pytest.mark.asyncio
-async def test_user_key_mode_skips_admin_namespace_policy_lookup(monkeypatch):
-    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
+@pytest.mark.parametrize("api_key_type", ["root", "user"])
+async def test_viking_client_initializes_without_admin_account_lookup(monkeypatch, api_key_type):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config(api_key_type))
 
-    client = VikingClient()
+    lookup = AsyncMock(return_value=[])
+    monkeypatch.setattr(_DummyHTTPClient, "admin_list_accounts", lookup)
+    initialize = AsyncMock()
+    monkeypatch.setattr(_DummyHTTPClient, "initialize", initialize)
 
-    async def _must_not_call_admin_api():
-        raise AssertionError("user key mode must not call admin namespace policy API")
+    client = await VikingClient.create(agent_id="workspace")
 
-    monkeypatch.setattr(client.client, "admin_list_accounts", _must_not_call_admin_api)
-
-    await client._load_namespace_policy()
-
-    assert client._namespace_policy_loaded is True
-    assert client._namespace_policy == {
-        "isolate_user_scope_by_agent": False,
-        "isolate_agent_scope_by_user": False,
-    }
+    initialize.assert_awaited_once()
+    lookup.assert_not_called()
+    expected = "viking://user/alice/memories/" if api_key_type == "root" else "viking://~/memories/"
+    assert client._memory_target_uri("alice") == expected
 
 
 def test_viking_client_request_connection_uses_active_identity(monkeypatch):
@@ -945,9 +957,9 @@ def test_viking_client_request_connection_uses_active_identity(monkeypatch):
     assert client.account_id == "acct"
     assert client.admin_user_id == "anonymous"
     assert client.agent_id == "web-playground"
-    assert client._namespace_policy_loaded is True
+    assert "namespace_policy" not in client._request_connection
     assert client.should_sender_fanout() is False
-    assert client._memory_target_uri(None) == "viking://user/memories/"
+    assert client._memory_target_uri(None) == "viking://~/memories/"
     assert first.kwargs == {
         "url": "http://ov.local",
         "api_key": "anonymous-key",
@@ -1080,10 +1092,6 @@ async def test_request_connection_search_memory_uses_request_client_only(monkeyp
             "agent_id": "web-playground",
             "role": "user",
             "api_key_type": "user",
-            "namespace_policy": {
-                "isolate_user_scope_by_agent": False,
-                "isolate_agent_scope_by_user": False,
-            },
         },
     )
 
@@ -1097,7 +1105,7 @@ async def test_request_connection_search_memory_uses_request_client_only(monkeyp
     assert result == {"user_memory": [], "agent_memory": []}
     first = _DummyHTTPClient.instances[0]
     assert len(first.find_calls) == 2
-    assert first.find_calls[0][1]["target_uri"] == "viking://user/memories/"
+    assert first.find_calls[0][1]["target_uri"] == "viking://~/memories/"
     assert first.find_calls[1][1]["target_uri"] == "viking://agent/web-playground/memories/"
 
 
@@ -1896,9 +1904,9 @@ async def test_viking_client_ensure_session_creates_after_legacy_not_found(monke
     async def _get_session(_session_id):
         raise NotFoundError("Resource not found")
 
-    async def _create_session(session_id=None, memory_policy=None):
-        created.append((session_id, memory_policy))
-        return {"session_id": session_id, "memory_policy": memory_policy}
+    async def _create_session(session_id=None, options=None):
+        created.append((session_id, options))
+        return {"session_id": session_id, "memory_policy": (options or {}).get("memory_policy")}
 
     monkeypatch.setattr(client.client, "get_session", _get_session)
     monkeypatch.setattr(client.client, "create_session", _create_session)
@@ -1909,7 +1917,52 @@ async def test_viking_client_ensure_session_creates_after_legacy_not_found(monke
     )
 
     assert result == {"session_id": "session-1", "memory_policy": {"strategy": "compact"}}
-    assert created == [("session-1", {"strategy": "compact"})]
+    assert created == [
+        ("session-1", {"memory_policy": {"strategy": "compact"}}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_viking_client_find_forwards_advanced_fields_via_sdk_options(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("root"))
+    client = VikingClient(workspace_id="workspace")
+    calls = []
+
+    async def _find(query="", target_uri="", limit=10, image=None, options=None):
+        calls.append(
+            {
+                "query": query,
+                "target_uri": target_uri,
+                "limit": limit,
+                "image": image,
+                "options": options,
+            }
+        )
+        return {"memories": []}
+
+    monkeypatch.setattr(client.client, "find", _find)
+
+    result = await client.find(
+        "hello",
+        target_uri="viking://~/memories/",
+        context_type="memory",
+        filter={"tags": ["important"]},
+        limit=3,
+    )
+
+    assert result == {"memories": []}
+    assert calls == [
+        {
+            "query": "hello",
+            "target_uri": "viking://~/memories/",
+            "limit": 3,
+            "image": None,
+            "options": {
+                "context_type": "memory",
+                "filter": {"tags": ["important"]},
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -1956,6 +2009,27 @@ async def test_read_content_trusted_owner_uri_uses_owner_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_image_reads_trusted_owner_uri_use_owner_identity(monkeypatch):
+    monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("root"))
+    client = VikingClient()
+    uri = "viking://user/sender-1/resources/image.png"
+
+    stat = await client.stat(uri)
+    content = await client.download_bytes(uri)
+
+    assert stat == {"size": 8, "isDir": False}
+    assert content == b"image"
+    stat_client, download_client = _DummyHTTPClient.instances[1:]
+    for scoped in (stat_client, download_client):
+        assert scoped.kwargs["api_key"] == "root-key"
+        assert scoped.kwargs["account"] == "acct"
+        assert scoped.kwargs["user"] == "sender-1"
+        assert scoped.closed is True
+    assert stat_client.stat_calls == [uri]
+    assert download_client.download_calls == [uri]
+
+
+@pytest.mark.asyncio
 async def test_search_memory_peer_ids_use_explicit_peer_uris(monkeypatch):
     monkeypatch.setattr(ov_server_module, "load_config", lambda: _make_config("user"))
     client = VikingClient()
@@ -1974,8 +2048,8 @@ async def test_search_memory_peer_ids_use_explicit_peer_uris(monkeypatch):
     await client.search_memory("hello", peer_ids=["sender-1", "sender-2"], limit=5)
 
     assert calls == [
-        ("hello", "viking://user/peers/sender-1/memories/", 5),
-        ("hello", "viking://user/peers/sender-2/memories/", 5),
+        ("hello", "viking://~/peers/sender-1/memories/", 5),
+        ("hello", "viking://~/peers/sender-2/memories/", 5),
     ]
 
 
@@ -2130,7 +2204,7 @@ async def test_viking_memory_type_quota_actor_scope_keeps_per_type_limits(tmp_pa
         actor_peer_id = "sender-1"
 
         def _current_peer_memory_target_uri(self, peer_id):
-            return f"viking://user/peers/{peer_id}/memories/"
+            return f"viking://~/peers/{peer_id}/memories/"
 
         async def find(self, *, query, target_uri, context_type=None, limit):
             calls.append(
@@ -2145,7 +2219,7 @@ async def test_viking_memory_type_quota_actor_scope_keeps_per_type_limits(tmp_pa
                 return {
                     "memories": [
                         {
-                            "uri": "viking://user/peers/sender-1/memories/events/e1.md",
+                            "uri": "viking://user/default/peers/sender-1/memories/events/e1.md",
                             "abstract": "event",
                             "score": 0.9,
                         },
@@ -2165,19 +2239,19 @@ async def test_viking_memory_type_quota_actor_scope_keeps_per_type_limits(tmp_pa
     assert calls == [
         {
             "query": "hello",
-            "target_uri": "viking://user/peers/sender-1/memories/events/",
+            "target_uri": "viking://~/peers/sender-1/memories/events/",
             "context_type": "memory",
             "limit": 1,
         },
         {
             "query": "hello",
-            "target_uri": "viking://user/peers/sender-1/memories/entities/",
+            "target_uri": "viking://~/peers/sender-1/memories/entities/",
             "context_type": "memory",
             "limit": 1,
         },
         {
             "query": "hello",
-            "target_uri": "viking://user/peers/sender-1/memories/preferences/",
+            "target_uri": "viking://~/peers/sender-1/memories/preferences/",
             "context_type": "memory",
             "limit": 1,
         },
@@ -2232,7 +2306,7 @@ async def test_viking_memory_context_uses_target_peer_actor_for_additional_peer_
             self.actor_peer_id = actor_peer_id
 
         def _current_peer_memory_target_uri(self, peer_id):
-            return f"viking://user/peers/{peer_id}/memories/"
+            return f"viking://~/peers/{peer_id}/memories/"
 
         async def find(self, *, query, target_uri, context_type=None, limit):
             if target_uri.endswith("/events/"):
@@ -2240,7 +2314,8 @@ async def test_viking_memory_context_uses_target_peer_actor_for_additional_peer_
                     "memories": [
                         {
                             "uri": (
-                                f"viking://user/peers/{self.actor_peer_id}/memories/events/e1.md"
+                                "viking://user/default/peers/"
+                                f"{self.actor_peer_id}/memories/events/e1.md"
                             ),
                             "score": 0.9,
                         }
@@ -2281,8 +2356,8 @@ async def test_viking_memory_context_uses_target_peer_actor_for_additional_peer_
 
     assert create_actor_ids == ["sender-1", "speaker-a", "speaker-a"]
     assert read_calls == [
-        ("sender-1", "viking://user/peers/sender-1/memories/events/e1.md", "read"),
-        ("speaker-a", "viking://user/peers/speaker-a/memories/events/e1.md", "read"),
+        ("sender-1", "viking://user/default/peers/sender-1/memories/events/e1.md", "read"),
+        ("speaker-a", "viking://user/default/peers/speaker-a/memories/events/e1.md", "read"),
     ]
     assert closed == ["speaker-a", "speaker-a", "sender-1"]
     assert "content via sender-1" in result
@@ -2554,11 +2629,12 @@ async def test_openviking_search_uses_user_namespace(monkeypatch):
     tool_context = SimpleNamespace(workspace_id="workspace", memory_owner_user_ids=["sender-1"])
     result = await tool.execute(tool_context, query="hello")
 
-    assert "sender-1/memories" in result
+    assert "memories" in result
     assert calls == [
         ("viking://resources/", None),
-        ("viking://user/sender-1/memories/", "sender-1"),
-        ("viking://user/sender-1/skills/", "sender-1"),
+        ("viking://~/resources/", "sender-1"),
+        ("viking://~/memories/", "sender-1"),
+        ("viking://~/skills/", "sender-1"),
     ]
 
 
@@ -2590,11 +2666,12 @@ async def test_openviking_search_user_key_mode_uses_current_user_namespace(monke
     assert "sender-1/memories" in result
     assert calls == [
         ("viking://resources/", None),
-        ("viking://user/memories/", None),
-        ("viking://user/skills/", None),
-        ("viking://user/peers/sender-0/memories/", None),
-        ("viking://user/peers/sender-1/memories/", None),
-        ("viking://user/peers/sender-2/memories/", None),
+        ("viking://~/resources/", None),
+        ("viking://~/memories/", None),
+        ("viking://~/skills/", None),
+        ("viking://~/peers/sender-0/memories/", None),
+        ("viking://~/peers/sender-1/memories/", None),
+        ("viking://~/peers/sender-2/memories/", None),
     ]
 
 
@@ -2610,17 +2687,19 @@ async def test_openviking_search_actor_client_expands_current_peer_scope(monkeyp
             return True
 
         def _memory_target_uri(self, _user_id=None):
-            return "viking://user/memories/"
+            return "viking://~/memories/"
 
         def build_current_memory_target_uris(self, *, peer_ids=None, include_self=True):
-            uris = ["viking://user/memories/"] if include_self else []
-            uris.extend(f"viking://user/peers/{peer_id}/memories/" for peer_id in peer_ids or [])
+            uris = ["viking://~/memories/"] if include_self else []
+            uris.extend(f"viking://~/peers/{peer_id}/memories/" for peer_id in peer_ids or [])
             return uris
 
         async def search(self, query, target_uri=None, limit=20, user_id=None):
             calls.append((target_uri, user_id))
             return {
-                "memories": [{"uri": "viking://user/peers/sender-0/memories/a.md", "score": 0.9}]
+                "memories": [
+                    {"uri": "viking://user/default/peers/sender-0/memories/a.md", "score": 0.9}
+                ]
             }
 
         async def close(self):
@@ -2641,11 +2720,12 @@ async def test_openviking_search_actor_client_expands_current_peer_scope(monkeyp
     assert "sender-0/memories" in result
     assert calls == [
         ("viking://resources/", None),
-        ("viking://user/memories/", None),
-        ("viking://user/skills/", None),
-        ("viking://user/peers/sender-0/memories/", None),
-        ("viking://user/peers/sender-1/memories/", None),
-        ("viking://user/peers/sender-2/memories/", None),
+        ("viking://~/resources/", None),
+        ("viking://~/memories/", None),
+        ("viking://~/skills/", None),
+        ("viking://~/peers/sender-0/memories/", None),
+        ("viking://~/peers/sender-1/memories/", None),
+        ("viking://~/peers/sender-2/memories/", None),
         ("close", None),
     ]
 
@@ -2677,10 +2757,10 @@ async def test_openviking_grep_default_memory_expands_current_peer(monkeypatch):
 
     class _FakeClient:
         def _memory_target_uri(self, _user_id=None):
-            return "viking://user/memories/"
+            return "viking://~/memories/"
 
         def build_current_memory_target_uris(self, *, peer_ids=None, include_self=True):
-            uris = ["viking://user/memories/"] if include_self else []
+            uris = ["viking://~/memories/"] if include_self else []
             uris.extend(
                 f"viking://user/default/peers/{peer_id}/memories/" for peer_id in peer_ids or []
             )
@@ -2697,12 +2777,12 @@ async def test_openviking_grep_default_memory_expands_current_peer(monkeypatch):
 
     await tool.execute(
         SimpleNamespace(workspace_id="workspace", sender_id="sender-0"),
-        uri="viking://user/memories/",
+        uri="viking://~/memories/",
         pattern="hello",
     )
 
     assert calls == [
-        ("viking://user/memories/", "hello", False, None),
+        ("viking://~/memories/", "hello", False, None),
         ("viking://user/default/peers/sender-0/memories/", "hello", False, None),
     ]
 
@@ -2714,16 +2794,17 @@ async def test_openviking_list_default_memory_expands_current_peer(monkeypatch):
 
     class _FakeClient:
         def _memory_target_uri(self, _user_id=None):
-            return "viking://user/memories/"
+            return "viking://~/memories/"
 
         def build_current_memory_target_uris(self, *, peer_ids=None, include_self=True):
-            uris = ["viking://user/memories/"] if include_self else []
+            uris = ["viking://~/memories/"] if include_self else []
             uris.extend(
                 f"viking://user/default/peers/{peer_id}/memories/" for peer_id in peer_ids or []
             )
             return uris
 
-        async def list_resources(self, path=None, recursive=False):
+        async def list_resources(self, path=None, recursive=False, node_limit=1000):
+            del node_limit
             calls.append((path, recursive))
             return []
 
@@ -2733,12 +2814,14 @@ async def test_openviking_list_default_memory_expands_current_peer(monkeypatch):
     monkeypatch.setattr(tool, "_get_client", _fake_get_client)
 
     await tool.execute(
+        # Legacy uid-less spelling: still recognized as "the default memory target" so
+        # stored configs / LLM output keep working, but expanded to the ~ home alias.
         SimpleNamespace(workspace_id="workspace", sender_id="sender-0"),
         uri="viking://user/memories/",
     )
 
     assert calls == [
-        ("viking://user/memories/", False),
+        ("viking://~/memories/", False),
         ("viking://user/default/peers/sender-0/memories/", False),
     ]
 
@@ -2750,10 +2833,10 @@ async def test_openviking_glob_root_adds_current_peer_memory(monkeypatch):
 
     class _FakeClient:
         def _memory_target_uri(self, _user_id=None):
-            return "viking://user/memories/"
+            return "viking://~/memories/"
 
         def build_current_memory_target_uris(self, *, peer_ids=None, include_self=True):
-            uris = ["viking://user/memories/"] if include_self else []
+            uris = ["viking://~/memories/"] if include_self else []
             uris.extend(
                 f"viking://user/default/peers/{peer_id}/memories/" for peer_id in peer_ids or []
             )
@@ -2775,8 +2858,9 @@ async def test_openviking_glob_root_adds_current_peer_memory(monkeypatch):
 
     assert calls == [
         ("*.md", "viking://resources/"),
-        ("*.md", "viking://user/memories/"),
-        ("*.md", "viking://user/skills/"),
+        ("*.md", "viking://~/resources/"),
+        ("*.md", "viking://~/memories/"),
+        ("*.md", "viking://~/skills/"),
         ("*.md", "viking://user/default/peers/sender-0/memories/"),
     ]
 
@@ -2813,8 +2897,9 @@ async def test_openviking_glob_root_uses_namespaced_self_targets_for_root_key(mo
 
     assert calls == [
         ("*.md", "viking://resources/"),
-        ("*.md", "viking://user/admin/memories/"),
-        ("*.md", "viking://user/admin/skills/"),
+        ("*.md", "viking://~/resources/"),
+        ("*.md", "viking://~/memories/"),
+        ("*.md", "viking://~/skills/"),
         ("*.md", "viking://user/admin/peers/sender-0/memories/"),
     ]
 

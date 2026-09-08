@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from openviking_cli.session.user_id import UserIdentifier
 
+from .cache_config import CacheConfig
 from .config_loader import resolve_config_path
 from .config_utils import format_validation_error, raise_unknown_config_fields
 from .consts import (
@@ -28,10 +29,10 @@ from .log_config import LogConfig
 from .memory_config import MemoryConfig
 from .oauth_config import OAuthConfig
 from .parser_config import (
+    AnydocConfig,
     AudioConfig,
     CodeConfig,
     DirectoryConfig,
-    ExcelConfig,
     FeishuConfig,
     HTMLConfig,
     ImageConfig,
@@ -52,7 +53,7 @@ from .telemetry_config import TelemetryConfig
 from .vlm_config import VLMConfig
 
 
-def _get_config_warning_logger():
+def _get_config_logger():
     """Use stdlib logging during config bootstrap to avoid early logger side effects."""
     return logging.getLogger(__name__)
 
@@ -135,6 +136,27 @@ class ParserApiConfig(BaseModel):
         return self
 
 
+class CompileApiConfig(BaseModel):
+    """Configuration for the external Compile task API."""
+
+    base_url: str = ""
+    gateway_token: str = ""
+    http_timeout_seconds: float = 10.0
+    poll_interval_ms: int = 30000
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _validate(self) -> "CompileApiConfig":
+        if self.base_url and "://" not in self.base_url:
+            raise ValueError("compile_api.base_url must include scheme (e.g., https://...)")
+        if self.http_timeout_seconds <= 0:
+            raise ValueError("compile_api.http_timeout_seconds must be > 0")
+        if self.poll_interval_ms <= 0:
+            raise ValueError("compile_api.poll_interval_ms must be > 0")
+        self.base_url = self.base_url.rstrip("/")
+        return self
+
+
 class OpenVikingConfig(BaseModel):
     """Main configuration for OpenViking."""
 
@@ -145,6 +167,11 @@ class OpenVikingConfig(BaseModel):
     default_agent: Optional[str] = Field(
         default=None,
         description="Deprecated and ignored. User is the only data-plane identity.",
+    )
+
+    cache: Optional[CacheConfig] = Field(
+        default=None,
+        description="Global cache Provider configuration",
     )
 
     storage: StorageConfig = Field(
@@ -206,12 +233,9 @@ class OpenVikingConfig(BaseModel):
         default_factory=MarkdownConfig, description="Markdown parsing configuration"
     )
 
-    excel: ExcelConfig = Field(
-        # from_dict on an empty mapping, not the bare constructor: an absent
-        # parsers.excel section must record that no key was set, so sectioning
-        # still follows parsers.markdown for deployments predating this section.
-        default_factory=lambda: ExcelConfig.from_dict({}),
-        description="Excel parsing configuration",
+    anydoc: AnydocConfig = Field(
+        default_factory=AnydocConfig,
+        description="Shared anydoc Office conversion configuration",
     )
 
     html: HTMLConfig = Field(default_factory=HTMLConfig, description="HTML parsing configuration")
@@ -250,6 +274,11 @@ class OpenVikingConfig(BaseModel):
     parser_api: ParserApiConfig = Field(
         default_factory=ParserApiConfig,
         description="Third-party parser API configuration (files/responses)",
+    )
+
+    compile_api: CompileApiConfig = Field(
+        default_factory=CompileApiConfig,
+        description="External Compile task API configuration",
     )
 
     connector: ConnectorConfig = Field(
@@ -302,11 +331,19 @@ class OpenVikingConfig(BaseModel):
     @model_validator(mode="after")
     def _warn_on_deprecated_language_fallback(self) -> "OpenVikingConfig":
         if self.language_fallback and self.language_fallback != "en":
-            _get_config_warning_logger().warning(
+            _get_config_logger().warning(
                 "Config field 'language_fallback=%s' is deprecated and has no effect; "
                 "remove it, or set 'output_language_override' to pin an explicit language.",
                 self.language_fallback,
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cache_runtime_config(self) -> "OpenVikingConfig":
+        agfs = self.storage.agfs
+        uses_canonical_cache = agfs.cachefs.backend == "cache" or agfs.queuefs.backend == "cache"
+        if uses_canonical_cache and self.cache is None:
+            raise ValueError("top-level cache config is required when an AGFS backend uses cache")
         return self
 
     @model_validator(mode="before")
@@ -361,6 +398,33 @@ class OpenVikingConfig(BaseModel):
         data["git"] = git
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_cache_config(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        storage_value = data.get("storage")
+        if not isinstance(storage_value, dict):
+            return data
+        agfs_value = storage_value.get("agfs")
+        if not isinstance(agfs_value, dict):
+            return data
+        if "cache" in agfs_value:
+            raise ValueError(
+                "storage.agfs.cache has been removed; configure cache.provider/cache.params "
+                "and storage.agfs.cachefs.backend='cache'"
+            )
+        queuefs = agfs_value.get("queuefs")
+        if isinstance(queuefs, dict) and (
+            queuefs.get("backend") == "redis" or "redis" in queuefs
+        ):
+            raise ValueError(
+                "storage.agfs.queuefs backend='redis' and queuefs.redis have been removed; "
+                "use backend='cache' with top-level cache.provider/cache.params"
+            )
+        return data
+
     allow_private_networks: bool = Field(
         default=False,
         description=(
@@ -407,7 +471,7 @@ class OpenVikingConfig(BaseModel):
                 "audio",
                 "video",
                 "markdown",
-                "excel",
+                "anydoc",
                 "html",
                 "text",
                 "directory",
@@ -432,6 +496,13 @@ class OpenVikingConfig(BaseModel):
                     parser_configs = {}
                 if not isinstance(parser_configs, dict):
                     raise ValueError("Invalid parsers config: 'parsers' section must be an object")
+                parser_configs = parser_configs.copy()
+                if "excel" in parser_configs:
+                    parser_configs.pop("excel")
+                    _get_config_logger().error(
+                        "Config field 'parsers.excel' was removed and is ignored; "
+                        "spreadsheet parsing now uses 'parsers.anydoc'."
+                    )
             raise_unknown_config_fields(
                 data=parser_configs,
                 valid_fields=set(parser_types),
